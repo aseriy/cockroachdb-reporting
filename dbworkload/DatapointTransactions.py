@@ -8,7 +8,7 @@ import string
 import json
 from sentence_transformers import SentenceTransformer
 
-class Datapointoltp:
+class Datapointtransactions:
 
     def __init__(self, args: dict):
         # args is a dict of string passed with the --args flag
