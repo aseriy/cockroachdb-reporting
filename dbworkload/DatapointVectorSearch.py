@@ -4,14 +4,11 @@ import random
 import time
 import uuid
 import json
-
 from DatapointTransactions import Datapointtransactions
 
 
 class Datapointvectorsearch:
     def __init__(self, args: dict):
-        # args is a dict of string passed with the --args flag
-        # user passed a yaml/json, in python that's a dict object
         self.datapoint = Datapointtransactions({})
 
 

@@ -11,8 +11,15 @@ from sentence_transformers import SentenceTransformer
 class Datapointtransactions:
 
     def __init__(self, args: dict):
-        # args is a dict of string passed with the --args flag
-        # user passed a yaml/json, in python that's a dict object
+        # args = {
+        #     "region":     a valid region from geos.crdb_region column
+        #                   if no region specified, emulate station across all regions
+        # }
+
+        self.region = None
+        if "region" in args:
+            self.region = args["region"]
+            print("Region: ", self.region)
 
         self.init_random_ranges = {
             "interval": {
@@ -46,7 +53,6 @@ class Datapointtransactions:
                 "high": 32
             }
         }
-
 
 
 
@@ -98,10 +104,21 @@ class Datapointtransactions:
 
 
     def create_datapoint(self, conn: psycopg.Connection):
+        where = ''
+        if self.region:
+            where = f"WHERE g.crdb_region = '{self.region}'"
+    
+        sql = f"""
+            SELECT s.id, g.crdb_region
+            FROM stations AS s
+            JOIN geos AS g on s.geo = g.id
+            {where}
+            ORDER BY random()
+            LIMIT 1
+        """
+
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT s.id, g.crdb_region FROM stations AS s JOIN geos AS g on s.geo = g.id ORDER BY random() LIMIT 1"
-            )
+            cur.execute(sql)
             (station_id, station_region) = cur.fetchone()
 
 
