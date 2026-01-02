@@ -1,6 +1,7 @@
 import argparse
 import psycopg
 import polars as pl
+import json
 
 
 def get_primary_key_columns(conn, table_name):
@@ -28,31 +29,81 @@ def fetch_pk_rows(conn, table_name, pk_cols):
     cols = ", ".join(pk_cols)
     query = f"SELECT {cols} FROM {table_name}"
 
-    with conn.cursor() as cur:
-        cur.execute(query)
-        rows = cur.fetchall()
+    stream = pl.read_database(
+        query = query,
+        connection = conn,
+        iter_batches = True,
+        batch_size = 1000
+    )
 
-    return pl.from_records(rows, schema=pk_cols)
+    range_stats = {}
+
+    for batch in stream:
+        print(batch)
+        with conn.cursor() as cur:
+            for row in batch.iter_rows(named=True):
+                values = ", ".join(
+                    "'" + str(row[col]).replace("'", "''") + "'" for col in pk_cols
+                )
+                stmt = f"""
+                    SELECT range_id, lease_holder, replicas, replica_localities FROM [
+                        SHOW RANGE FROM TABLE {table_name} FOR ROW ({values})
+                    ]
+                    ORDER BY range_id
+                """
+                cur.execute(stmt)
+                ranges = cur.fetchall()
+                data = parse_row_info(row, ranges)
+                merge_stats(range_stats, data)
+                # print(range_stats)
 
 
-def show_ranges(conn, table_name, pk_cols, df):
-    with conn.cursor() as cur:
-        for row in df.iter_rows(named=True):
-            values = ", ".join(
-                "'" + str(row[col]).replace("'", "''") + "'" for col in pk_cols
-            )
-            stmt = f"""
-                SELECT range_id, lease_holder, replicas, replica_localities FROM [
-                    SHOW RANGE FROM TABLE {table_name} FOR ROW ({values})
-                ]
-                ORDER BY range_id
-            """
-            cur.execute(stmt)
-            ranges = cur.fetchall()
+    print(range_stats)
 
-            print(f"\nRow {row}:")
-            for r in ranges:
-                print(r)
+    # return pl.from_records(rows, schema=pk_cols)
+    return None
+
+
+
+def merge_stats(range_stats, data):
+    for range_id, data in data.items():
+        entry = range_stats.setdefault(
+            range_id,
+            {
+                "replicas": set(),
+                "leaseholder": None,
+                "rows": 0
+            },
+        )
+
+        entry["rows"] += 1
+
+        for replica in data.get("replicas", []):
+            entry["replicas"].add(tuple(replica))
+
+        if "leaseholder" in data:
+            entry["leaseholder"] = tuple(data["leaseholder"])
+
+
+
+def parse_row_info(row, ranges):
+    data = {}
+    # print(f"\nRow {row}:")
+    for r in ranges:
+        range_id, leaseholder, replicas, replica_locations = r
+
+        data[range_id] = {
+            "replicas": tuple(sorted(
+                            ((x.split("=", 1)[1], r) for x, r in zip(replica_locations, replicas)),
+                            key=lambda t: t[0]
+                        ))
+        }
+
+        data[range_id]["leaseholder"] = next(t for t in data[range_id]["replicas"] if t[1] == leaseholder)
+
+    # print(json.dumps(data, indent=2))
+    return data
+
 
 
 def main():
@@ -64,7 +115,6 @@ def main():
     with psycopg.connect(args.url) as conn:
         pk_cols = get_primary_key_columns(conn, args.table)
         df = fetch_pk_rows(conn, args.table, pk_cols)
-        show_ranges(conn, args.table, pk_cols, df)
 
 
 if __name__ == "__main__":
