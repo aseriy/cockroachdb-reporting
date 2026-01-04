@@ -20,10 +20,6 @@ ALTER DATABASE nextgenreporting ADD REGION "gcp-europe-west3";
 ALTER DATABASE nextgenreporting ADD REGION "gcp-southamerica-east1";
 ```
 
-```sql
-ALTER DATABASE nextgenreporting SET SECONDARY REGION "gcp-europe-west3";
-```
-
 
 ```sql
 SHOW REGIONS FROM DATABASE nextgenreporting;             
@@ -76,7 +72,7 @@ ALTER TABLE datapoints SET LOCALITY REGIONAL BY ROW;
   archive | {}    | {nextgenreporting} | {}                 | {}
   report  | {}    | {nextgenreporting} | {}                 | {}
   tx1     | {}    | {nextgenreporting} | {nextgenreporting} | {}
-  tx2     | {}    | {nextgenreporting} | {}                 | {nextgenreporting}
+  tx2     | {}    | {nextgenreporting} | {}                 | {}
   tx3     | {}    | {nextgenreporting} | {}                 | {}
 (5 rows)
 
@@ -187,30 +183,12 @@ FROM [SHOW RANGE FROM TABLE datapoints FOR ROW ('tx1', 0, '00ee18f6-60a4-4bf0-af
 
 ## Archiving
 
-```sql
-UPDATE datapoints d
-SET crdb_region = v.new_region
-FROM (
-    SELECT
-        station,
-        at,
-        CASE floor(random() * 3)
-            WHEN 0 THEN 'ar1'
-            WHEN 1 THEN 'ar2'
-            ELSE 'ar3'
-        END::public.crdb_internal_region AS new_region
-    FROM public.datapoints
-    WHERE at < now() - INTERVAL '1 year'
-) AS v
-WHERE d.station = v.station
-  AND d.at = v.at;
-```
 
 ```sql
 WITH batch AS (
     SELECT at, station
     FROM datapoints
-    WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 year'
+    WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 month'
     LIMIT 1000
 ),
 region AS (

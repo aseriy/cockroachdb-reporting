@@ -57,11 +57,7 @@ def fetch_pk_rows(conn, table_name, pk_cols):
                 merge_stats(range_stats, data)
                 # print(range_stats)
 
-
-    print(range_stats)
-
-    # return pl.from_records(rows, schema=pk_cols)
-    return None
+    return range_stats
 
 
 
@@ -101,8 +97,55 @@ def parse_row_info(row, ranges):
 
         data[range_id]["leaseholder"] = next(t for t in data[range_id]["replicas"] if t[1] == leaseholder)
 
-    # print(json.dumps(data, indent=2))
     return data
+
+
+def print_range_table(range_stats):
+    rows = []
+    total_rows = 0
+
+    for i, (range_id, d) in enumerate(sorted(range_stats.items()), start=1):
+        total_rows += d["rows"]
+        rows.append([
+            str(i),                         # row number
+            str(range_id),
+            str(d["rows"]),
+            f"{d['leaseholder'][0]} ({d['leaseholder'][1]})",
+            ", ".join(f"{n} ({s})" for n, s in sorted(d["replicas"])),
+        ])
+
+    headers = ["", "range_id", "rows", "leaseholder", "replicas"]
+
+    # totals row
+    rows.append([
+        "",                                # no row number
+        "TOTAL",
+        str(total_rows),
+        "",
+        "",
+    ])
+
+    # compute widths (no truncation)
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(v) for v in col) for col in cols]
+
+    def line(left, mid, right):
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+
+    def row_line(values):
+        return "│ " + " │ ".join(v.ljust(w) for v, w in zip(values, widths)) + " │"
+
+    print(line("┌", "┬", "┐"))
+    print(row_line(headers))
+    print(line("╞", "╪", "╡"))
+
+    for r in rows[:-1]:
+        print(row_line(r))
+
+    print(line("├", "┼", "┤"))
+    print(row_line(rows[-1]))
+    print(line("└", "┴", "┘"))
+
 
 
 
@@ -114,7 +157,8 @@ def main():
 
     with psycopg.connect(args.url) as conn:
         pk_cols = get_primary_key_columns(conn, args.table)
-        df = fetch_pk_rows(conn, args.table, pk_cols)
+        stats = fetch_pk_rows(conn, args.table, pk_cols)
+        print_range_table(stats)
 
 
 if __name__ == "__main__":

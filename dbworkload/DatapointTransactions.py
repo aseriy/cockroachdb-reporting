@@ -27,7 +27,7 @@ class Datapointtransactions:
                 "high": 60
             },
             "date": {
-                "low": datetime(2024,1,1),
+                "low": datetime(2020,1,1),
                 "high": datetime(datetime.now().year, 12, 31)
             },
             "param0": {
