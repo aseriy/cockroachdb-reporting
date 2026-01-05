@@ -68,7 +68,7 @@ class Datapointhistoricextract:
                 JOIN datapoints AS d ON s.id = d.station                                  
                 JOIN geos AS g ON g.id = s.geo                                      
                 AS OF SYSTEM TIME follower_read_timestamp()
-                WHERE d.at < now() - INTERVAL '90 days'
+                WHERE d.at < now() - INTERVAL '1 month'
         """
 
         result = pl.read_database(

@@ -57,7 +57,7 @@ class Datapointreporting:
             cur.execute(
                 """
                     SELECT
-                        g.crdb_region,
+                        dp.crdb_region,
                         COUNT(dp.at),
                         MIN(dp.at),
                         MAX(dp.at),
@@ -67,8 +67,8 @@ class Datapointreporting:
                     JOIN stations AS s ON s.id = dp.station
                     JOIN geos AS g ON g.id = s.geo
                     AS OF SYSTEM TIME follower_read_timestamp()
-                    GROUP BY g.crdb_region
-                    ORDER BY g.crdb_region;
+                    GROUP BY dp.crdb_region
+                    ORDER BY dp.crdb_region;
                 """
             )
             cur.fetchone()

@@ -26,15 +26,16 @@ SHOW REGIONS FROM DATABASE nextgenreporting;
 ```
 
 ```bash
-      database     |         region         | primary | secondary |                                    zones
--------------------+------------------------+---------+-----------+-------------------------------------------------------------------------------
-  nextgenreporting | gcp-us-east1           |    t    |     f     | {gcp-us-east1-b,gcp-us-east1-c,gcp-us-east1-d}
-  nextgenreporting | gcp-europe-west3       |    f    |     t     | {gcp-europe-west3-a,gcp-europe-west3-b,gcp-europe-west3-c}
-  nextgenreporting | gcp-europe-west2       |    f    |     f     | {gcp-europe-west2-a,gcp-europe-west2-b,gcp-europe-west2-c}
-  nextgenreporting | gcp-southamerica-east1 |    f    |     f     | {gcp-southamerica-east1-a,gcp-southamerica-east1-b,gcp-southamerica-east1-c}
-  nextgenreporting | gcp-us-central1        |    f    |     f     | {gcp-us-central1-b,gcp-us-central1-c,gcp-us-central1-f}
-  nextgenreporting | gcp-us-west2           |    f    |     f     | {gcp-us-west2-a,gcp-us-west2-b,gcp-us-west2-c}
-(6 rows)
+      database     | region | primary | secondary | zones
+-------------------+--------+---------+-----------+--------
+  nextgenreporting | tx1    |    t    |     f     | {}
+  nextgenreporting | ar1    |    f    |     f     | {}
+  nextgenreporting | ar2    |    f    |     f     | {}
+  nextgenreporting | ar3    |    f    |     f     | {}
+  nextgenreporting | report |    f    |     f     | {}
+  nextgenreporting | tx2    |    f    |     f     | {}
+  nextgenreporting | tx3    |    f    |     f     | {}
+(7 rows)
 ```
 
 
@@ -185,7 +186,9 @@ FROM [SHOW RANGE FROM TABLE datapoints FOR ROW ('tx1', 0, '00ee18f6-60a4-4bf0-af
 
 
 ```sql
-WITH batch AS (
+WITH rows_updated AS (
+WITH
+batch AS (
     SELECT at, station
     FROM datapoints
     WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 month'
@@ -200,8 +203,58 @@ region AS (
 UPDATE datapoints
 SET crdb_region = region.r
 FROM batch, region
-WHERE datapoints.station = batch.station AND datapoints.at = batch.at;
+WHERE datapoints.station = batch.station AND datapoints.at = batch.at RETURNING 1
+) SELECT count(*) FROM rows_updated;
 ```
+
+
+```sql
+CREATE OR REPLACE PROCEDURE archive_datapoints() AS $$
+DECLARE
+  rows_updated_c INT := 0;
+
+BEGIN
+  LOOP
+    WITH rows_updated AS (
+    WITH
+    batch AS (
+        SELECT at, station
+        FROM datapoints
+        WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 month'
+        LIMIT 1000
+    ),
+    region AS (
+        SELECT r::crdb_internal_region
+        FROM (VALUES ('ar1'), ('ar2'), ('ar3')) v(r)
+        ORDER BY random()
+        LIMIT 1
+    )
+    UPDATE datapoints
+    SET crdb_region = region.r
+    FROM batch, region
+    WHERE datapoints.station = batch.station AND datapoints.at = batch.at RETURNING 1
+    ) SELECT count(*) INTO rows_updated_c FROM rows_updated;
+
+    RAISE NOTICE 'Updated % rows', rows_updated_c;
+    IF rows_updated_c < 1 THEN
+      RAISE NOTICE 'Done.';
+      EXIT;
+    END IF;
+    
+  END LOOP;
+END;
+$$ LANGUAGE PLpgSQL;
+```
+
+
+```sql
+CALL archive_datapoints();
+```
+
+
+
+
+
 
 List ranges associated with a table:
 
@@ -226,4 +279,82 @@ WITH batch AS (
 )
 SELECT batch.crdb_region FROM batch;
 ```
+
+Disk space per node:
+
+```sql
+SELECT
+  s.node_id,
+  n.locality,
+  sum(s.used) AS used_bytes
+FROM crdb_internal.kv_store_status AS s
+JOIN crdb_internal.gossip_nodes AS n
+  ON s.node_id = n.node_id
+GROUP BY s.node_id, n.locality
+ORDER BY s.node_id;
+```
+
+```bash
+  node_id |   locality    | used_bytes
+----------+---------------+-------------
+        1 | region=tx1    |  765351302
+        2 | region=tx3    | 1113006946
+        3 | region=tx1    |  854952805
+        4 | region=tx2    | 1216570863
+        5 | region=tx2    |  858028263
+        6 | region=tx1    | 1026987534
+        7 | region=tx3    |  938442685
+        8 | region=tx3    | 1196339104
+        9 | region=tx2    | 1291928021
+       10 | region=ar1    |  551337131
+       11 | region=report | 1398067654
+       12 | region=ar1    | 1069884182
+       13 | region=ar1    | 1049924737
+       14 | region=report | 1024862887
+       15 | region=report |  562929292
+       16 | region=ar2    | 1123908082
+       17 | region=ar2    | 1465644347
+       18 | region=ar2    |  614112864
+       19 | region=ar3    |  947927277
+       20 | region=ar3    | 1040088485
+       21 | region=ar3    | 1127466613
+(21 rows)
+```
+
+
+Reporting queries:
+
+```sql
+CREATE INDEX IF NOT EXISTS ON datapoints (at);
+```
+
+
+
+Materialized View (Reporting Region)
+
+```sql
+CREATE MATERIALIZED VIEW datapoints_mv AS
+SELECT  d.at, d.station, g.name,
+        d.param0, d.param1, d.param2,
+        d.param3, d.param4,
+        d.param5,d.param6
+FROM stations as s
+JOIN datapoints as d ON s.id = d.station
+JOIN geos AS g ON s.geo = g.id;
+```
+
+```sql
+ALTER TABLE datapoints_mv CONFIGURE ZONE USING
+    range_min_bytes = 134217728,
+    range_max_bytes = 536870912,
+    gc.ttlseconds = 14400,
+    global_reads = true,
+    num_replicas = 3,
+    num_voters = 3,
+    constraints = '{+region=report: 3}',
+    voter_constraints = '{+region=report}',
+    lease_preferences = '[[+region=report]]';
+```
+
+
 

@@ -63,6 +63,7 @@ class Datapointvectorsearch:
                     param5,
                     param6 <=> %s AS distance
                 FROM datapoints
+                AS OF SYSTEM TIME follower_read_timestamp()
                 ORDER BY param6 <=> %s
                 LIMIT 10;
         """
