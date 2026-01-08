@@ -1,0 +1,98 @@
+flowchart TB
+
+%% =====================
+%% Clients
+%% =====================
+Clients[Clients / Workloads]
+
+%% =====================
+%% Load Balancer Band
+%% =====================
+subgraph LB_BAND["Load Balancers (by intent)"]
+  direction LR
+  LBTX1["LB<BR/>tx1"]
+  LBTX2["LB<BR/>tx2"]
+  LBTX3["LB<BR/>tx3"]
+  LBARCHIVE["LB<BR/>archive"]
+  LBREPORT["LB<BR/>report"]
+end
+
+Clients --> LBTX1
+Clients --> LBTX2
+Clients --> LBTX3
+Clients --> LBARCHIVE
+Clients --> LBREPORT
+
+%% =====================
+%% CockroachDB Cluster
+%% =====================
+subgraph CRDB["CockroachDB Cluster"]
+  direction LR
+
+  %% -------- Super Region: transact --------
+  subgraph TRANSACT["Super Region: transact"]
+    direction LR
+
+    subgraph TX1["Region: tx1"]
+      N1["1"]
+      N3["3"]
+      N6["6"]
+    end
+
+    subgraph TX2["Region: tx2"]
+      N4["4"]
+      N5["5"]
+      N9["9"]
+    end
+
+    subgraph TX3["Region: tx3"]
+      N2["2"]
+      N7["7"]
+      N8["8"]
+    end
+  end
+
+  %% -------- Super Region: archive --------
+  subgraph ARCHIVE["Super Region: archive"]
+    direction LR
+
+    subgraph AR1["Region: ar1"]
+      N10["10"]
+      N12["12"]
+      N13["13"]
+    end
+
+    subgraph AR2["Region: ar2"]
+      N16["16"]
+      N17["17"]
+      N18["18"]
+    end
+
+    subgraph AR3["Region: ar3"]
+      N19["19"]
+      N20["20"]
+      N21["21"]
+    end
+  end
+
+  %% -------- Reporting Region (No Super Region) --------
+  subgraph REPORT["Reporting Region"]
+    N11["11"]
+    N14["14"]
+    N15["15"]
+  end
+
+end
+
+%% =====================
+%% LB → Region Routing
+%% =====================
+LBTX1 --> TX1
+LBTX2 --> TX2
+LBTX3 --> TX3
+
+LBARCHIVE --> AR1
+LBARCHIVE --> AR2
+LBARCHIVE --> AR3
+
+LBREPORT --> REPORT
