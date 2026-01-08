@@ -28,7 +28,8 @@ class Datapointvectorsearch:
     # This process continues until dbworkload exits.
     def loop(self):
         return [
-                self.sql_find_similar_datapoints
+                self.sql_find_similar_datapoints_live,
+                self.sql_find_similar_datapoints_snapshot
             ]
 
 
@@ -44,7 +45,7 @@ class Datapointvectorsearch:
 
 
   
-    def sql_find_similar_datapoints(self, conn: psycopg.Connection):
+    def sql_find_similar_datapoints_live(self, conn: psycopg.Connection):
         datapoint = self.datapoint.create_datapoint(conn)
         # print(json.dumps(datapoint, indent=2))
 
@@ -63,6 +64,48 @@ class Datapointvectorsearch:
                     param5,
                     param6 <=> %s AS distance
                 FROM datapoints
+                AS OF SYSTEM TIME follower_read_timestamp()
+                ORDER BY param6 <=> %s
+                LIMIT 10;
+        """
+
+        with conn.cursor() as cur:
+            cur.execute(query, (vector,vector))
+            result = cur.fetchall()
+        
+        # print(f"\t\t\t{self.datapoint_str(datapoint)}\n")
+        # for r in result:
+        #     rdp = {
+        #         "param0":   r[2],
+        #         "param1":   r[3],
+        #         "param2":   r[4],
+        #         "param3":   r[5],
+        #         "param4":   r[6],
+        #         "param5":   r[7],
+        #     }
+        #     print(f"{r[8]}\t{self.datapoint_str(rdp)}\n")
+
+
+
+    def sql_find_similar_datapoints_snapshot(self, conn: psycopg.Connection):
+        datapoint = self.datapoint.create_datapoint(conn)
+        # print(json.dumps(datapoint, indent=2))
+
+
+        vector = datapoint["param6"]
+        
+        query = f"""
+                SELECT
+                    station,
+                    at,
+                    param0,
+                    param1,
+                    param2,
+                    param3,
+                    param4,
+                    param5,
+                    param6 <=> %s AS distance
+                FROM datapoints_mv
                 AS OF SYSTEM TIME follower_read_timestamp()
                 ORDER BY param6 <=> %s
                 LIMIT 10;
