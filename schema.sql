@@ -1,10 +1,11 @@
 CREATE TABLE geos (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name STRING UNIQUE NOT NULL,
-    crdb_region crdb_internal_region NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS geos_crdb_region_rec_idx ON nextgenreporting.public.geos (crdb_region); 
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    name STRING NOT NULL,
+    crdb_region public.crdb_internal_region NOT NULL,
+    CONSTRAINT geos_pkey PRIMARY KEY (id ASC),
+    UNIQUE INDEX geos_name_key (name ASC),
+    INDEX geos_crdb_region_rec_idx (crdb_region ASC)
+) LOCALITY GLOBAL;
 
 --
 -- Populate 'geos' table
@@ -12,7 +13,7 @@ CREATE INDEX IF NOT EXISTS geos_crdb_region_rec_idx ON nextgenreporting.public.g
 INSERT INTO geos (name, crdb_region)
 VALUES
   -- ===============================
-  -- Group 1: tx1 (US-East)
+  -- tx1 (US-East)
   -- ===============================
   ('US East (N. Virginia)',     'tx1'),
   ('US East (Ohio)',            'tx1'),
@@ -21,7 +22,7 @@ VALUES
   ('South America (São Paulo)', 'tx1'),
 
   -- ===============================
-  -- Group 2: tx2 (US-West)
+  -- tx2 (US-West)
   -- ===============================
   ('US Mountain (Utah)',        'tx2'),
   ('US West (N. California)',   'tx2'),
@@ -34,7 +35,7 @@ VALUES
   ('AP Northeast (Seoul)',      'tx2'),
 
   -- ==========================================
-  -- Group 3: tx3 (Frankfurt / EU)
+  -- tx3 (Frankfurt / EU)
   -- ==========================================
   ('EU Central (Frankfurt)',    'tx3'),
   ('EU West (Ireland)',         'tx3'),
@@ -47,11 +48,13 @@ VALUES
   ('Africa (Cape Town)',        'tx3');
 
 
-CREATE TABLE IF NOT EXISTS stations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    geo UUID NOT NULL REFERENCES geos(id) ON DELETE CASCADE,
-    INDEX index_geo (geo)
-);
+CREATE TABLE stations (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    geo UUID NOT NULL,
+    CONSTRAINT stations_pkey PRIMARY KEY (id ASC),
+    CONSTRAINT stations_geo_fkey FOREIGN KEY (geo) REFERENCES geos(id) ON DELETE CASCADE,
+    INDEX index_geo (geo ASC)
+) LOCALITY GLOBAL;
 
 
 --
@@ -71,30 +74,24 @@ ALTER TABLE stations SET LOCALITY GLOBAL;
 
 
 
-CREATE TABLE public.datapoints (
-	at TIMESTAMP NOT NULL,
-	station UUID NOT NULL,
-	param0 INT8 NULL,
-	param1 INT8 NULL,
-	param2 FLOAT8 NULL,
-	param3 FLOAT8 NULL,
-	param4 STRING NULL,
-	param5 JSONB NULL,
-	param6 VECTOR(384) NULL,
-	crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT gateway_region()::public.crdb_internal_region,
-	crdb_internal_at_station_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(at, station))), 16:::INT8)) VIRTUAL,
-	CONSTRAINT datapoints_pkey PRIMARY KEY (station ASC, at ASC) USING HASH WITH (bucket_count=16),
-	CONSTRAINT datapoints_station_fkey FOREIGN KEY (station) REFERENCES public.stations(id) ON DELETE CASCADE
+CREATE TABLE datapoints (
+    at TIMESTAMP NOT NULL,
+    station UUID NOT NULL,
+    param0 INT8 NULL,
+    param1 INT8 NULL,
+    param2 FLOAT8 NULL,
+    param3 FLOAT8 NULL,
+    param4 STRING NULL,
+    param5 JSONB NULL,
+    param6 VECTOR(384) NULL,
+    crdb_region public.crdb_internal_region NOT VISIBLE NOT NULL DEFAULT gateway_region()::public.crdb_internal_region,
+    crdb_internal_at_station_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(at, station))), 16:::INT8)) VIRTUAL,
+    CONSTRAINT datapoints_pkey PRIMARY KEY (station ASC, at ASC) USING HASH WITH (bucket_count=16),
+    CONSTRAINT datapoints_station_fkey FOREIGN KEY (station) REFERENCES stations(id) ON DELETE CASCADE,
+    INDEX datapoints_at_idx (at ASC),
+    VECTOR INDEX datapoints_param6_idx (param6 vector_l2_ops)
 ) LOCALITY REGIONAL BY ROW AS crdb_region;
 
--- -- Example: Force any rows coming from 'report' to 'tx1' instead
--- ALTER TABLE datapoints ALTER COLUMN crdb_region 
--- SET DEFAULT CASE WHEN gateway_region() = 'report' THEN 'tx1'::crdb_internal_region ELSE gateway_region() END;
-
-
---
--- REPORTING workloads
---
 
 --
 -- Create a vector index (will set it later in the reporting region)
@@ -111,4 +108,29 @@ CREATE INDEX IF NOT EXISTS datapoints_station_storing_rec_idx
 
 CREATE INDEX IF NOT EXISTS datapoints_at ON datapoints USING btree (at ASC);
 CREATE INDEX IF NOT EXISTS datapoints_param0_rec_idx ON datapoints (param0);
+
+
+
+
+--
+-- Materialized View
+--
+CREATE MATERIALIZED VIEW datapoints_mv AS
+SELECT  d.at, d.station, g.name,
+        d.param0, d.param1, d.param2,
+        d.param3, d.param4,
+        d.param5,d.param6
+FROM stations as s
+JOIN datapoints as d ON s.id = d.station
+JOIN geos AS g ON s.geo = g.id;
+
+CREATE INDEX ON datapoints_mv (length(param4));
+CREATE INVERTED INDEX param5_keys_idx ON datapoints_mv (param5);
+CREATE VECTOR INDEX ON datapoints_mv (param6);
+
+--
+-- REPORTING workloads
+--
+
+
 

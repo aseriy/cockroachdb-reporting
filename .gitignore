@@ -165,4 +165,3 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-CREDS.txt

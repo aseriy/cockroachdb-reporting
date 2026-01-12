@@ -1,7 +1,171 @@
-# cockroachdb-reporting
-Reference implementation for Part 2 of “Rethinking the Reporting Platform.” Demonstrates a multi-region CockroachDB setup for unified transactional and reporting workloads, with example schema, queries, and supporting code.
+# Introduction
+
+This repository contains the reference artifacts for Part 2 of Rethinking the Reporting Platform.
+
+It accompanies the article and provides the concrete schema, configuration, stored procedures, workloads, and inspection utilities used to exercise the architecture described there. The intent is to make specific architectural claims observable, not to provide a turnkey deployment or tutorial.
+
+All examples and outputs assume a CockroachDB cluster configured to match the architecture described in the article. Cluster creation and sizing are intentionally out of scope.
+
+Readers can use this repository selectively: to inspect mechanics, validate behavior, experiment with individual components, or use as a starting point in their own experimentations.
+
+# Database
+
+All examples in this repository use a single database with a deliberately small and explicit schema. The goal is not to model a complete production domain, but to make data placement, locality, and lifecycle behavior easy to reason about and inspect.
+
+The schema consists of three core tables:
+
+`geos`
+
+Models conceptual geography and its association with transactional placement. In a real system, this mapping would typically be implicit, derived from network topology and gateway locality. Here it is modeled explicitly so that placement intent can be driven as data and verified deterministically.
+
+`stations`
+
+Represents independent data-producing entities. Each station belongs to a geo and serves as a stable identifier that emits datapoints over time. This introduces realistic cardinality and fan-out without tying ingest behavior directly to infrastructure.
+
+Both geos and stations are small, mostly static, and read frequently. They are therefore marked GLOBAL, so they do not participate in regional placement tradeoffs.
+
+`datapoints`
+
+The primary fact table and the focus of the architecture. Each row represents a single datapoint produced by a station at a specific point in time. The table is defined as REGIONAL BY ROW, using an explicit region column as the locality key. This allows individual rows to be domiciled, replicated, and later moved according to lifecycle policy without changing schema or access patterns.
+
+The primary key (station, at) models a natural time-series pattern per station and is hashed to introduce controlled range fan-out. In addition to scalar attributes, the table includes a JSONB column for semi-structured data and a vector column for later semantic access patterns.
+
+Together, these tables form a minimal but sufficient foundation for demonstrating transactional ingest, regional placement, online lifecycle transitions, and reporting access on a single operational dataset.
+
+# Sample Workloads
+
+This repository includes a small set of dbworkload workload classes used to exercise specific architectural behaviors described in the article. These workloads are not benchmarks and are not intended to model production traffic patterns. Their purpose is to make placement, execution locality, snapshot semantics, and workload isolation observable.
+
+Each workload is executed against a specific cluster entry point. Workload intent is declared at connection time by choosing the appropriate endpoint, rather than inferred from query shape or runtime heuristics.
+
+## Transactional Ingest
+
+`DatapointTransactions.py`
+
+This workload emulates application-side ingest into the system.
+
+Each executing thread repeatedly selects a station, generates a synthetic datapoint, and inserts or upserts it into the datapoints table. An optional region argument allows ingest to be targeted to a specific transactional region. When no region is provided, ingest is distributed across all transactional regions.
+
+This workload exists to demonstrate:
+- deterministic row placement using regional-by-row locality,
+- concurrent transactional ingest across multiple regions,
+- ingestion of mixed data types (scalar, JSONB, vector),
+- and the separation between ingest traffic and reporting execution.
+
+The region argument is an emulation mechanism used to make placement behavior explicit and inspectable. In a real system, placement would typically be driven implicitly
+
+## Reporting Queries
+
+`DatapointReporting.py`
+
+This workload executes a fixed set of representative reporting queries against the live dataset.
+
+All queries are read-only and are executed using AS OF SYSTEM TIME follower_read_timestamp(), ensuring stable, repeatable snapshots while transactional ingest and lifecycle operations continue concurrently.
+
+The queries include:
+- aggregations by region,
+- time-based rollups,
+- joins across `datapoints`, `stations`, and `geos`.
+
+This workload is used to demonstrate:
+- reporting without reporting replicas,
+- execution isolation via a dedicated reporting entry point,
+- and consistent historical reads without coordination with transactional leaseholders.
+
+## Historical Extracts
+
+`DatapointHistoricExtract.py`
+
+This workload models large historical reads and bulk data extraction.
+
+It issues full and filtered snapshot queries using `AS OF SYSTEM TIME follower_read_timestamp()` and consumes results in bounded batches using Polars. This reflects how real extract jobs typically operate: streaming results with predictable memory usage rather than loading entire result sets at once.
+
+The workload demonstrates:
+- large, consistent historical reads without pipelines,
+- extracts operating directly on operational tables,
+- and flexible execution placement depending on resource needs.
 
 
+## Vector Search
+
+`DatapointVectorSearch.py`
+
+This workload exercises semantic access patterns using vector similarity search.
+
+It generates a synthetic datapoint, computes an embedding, and executes nearest-neighbor searches both:
+- directly against the base datapoints table, and
+- against the reporting materialized view.
+
+Both query paths use snapshot semantics. The distinction is not freshness, but shape and ownership: live operational data versus a curated, reporting-owned projection.
+
+This workload exists to demonstrate:
+- vector search as a first-class query pattern,
+- separation between live and curated semantic access,
+- and semantic querying without introducing a separate system.
+
+
+# Architecture Overview
+
+This reference architecture is a single CockroachDB cluster deliberately shaped to support multiple reporting-related workloads without splitting data across systems.
+
+The cluster is intentionally __non-uniform__. Nodes are grouped into regions with explicit roles, different resource profiles, and different access paths. The goal is to keep data in one place, while ensuring that transactional ingest, data lifecycle operations, and reporting queries do not interfere with each other.
+
+At a high level, the cluster supports three distinct concerns:
+- __Transactional ingest__, optimized for concurrent writes and short-lived updates
+- __Historical retention__, optimized for long-term storage with different cost and survivability characteristics
+- __Reporting execution__, optimized for read-heavy queries and large working sets
+
+All of these operate on the same database and schema. What differs is __where data lives__, __how it is replicated__, and __where queries execute__.
+
+## Regions and Super Regions
+
+This architecture makes explicit use of __regions__ and __super regions__ as policy boundaries.
+
+Transactional regions are grouped into a __transactional super region__, which defines placement, replication, and survivability guarantees for hot data. Archive regions are grouped into a separate archive super region, with different lifecycle and cost assumptions. These super regions directly control where replicas may live and what failures the system is designed to survive.
+
+Super regions are the mechanism that allows data to move through its lifecycle inside the database. When data transitions from transactional to archival storage, its regional locality changes. That single change is sufficient to trigger CockroachDB to re-replicate and re-domicile the affected ranges according to the archive super region’s policy—without copying data, changing schemas, or introducing pipelines.
+
+The __reporting region__ is intentionally __not part of any super region__. It does not define survivability for primary data and does not own replicas for transactional or archival ranges. Its role is execution, not storage.
+
+## Transactional Regions
+
+Transactional regions handle application ingest.
+
+They are sized and configured to support concurrent inserts and updates rather than large scans or aggregations. Data written by the application is placed using regional-by-row locality so that rows land in the intended transactional region and are replicated according to the transactional super region’s policy.
+
+Transactional traffic enters the system through __transactional entry points__, ensuring that ingest does not compete with reporting, extraction, or lifecycle workloads at the execution layer.
+
+## Archive Regions
+
+Archive regions exist to retain historical data with different performance and cost characteristics.
+
+Archived data is assumed to be stable: no longer updated frequently, but still queryable. Rows are moved into archive regions explicitly as part of their lifecycle by changing their regional locality. This reassigns placement and replication policy without changing how the data is accessed.
+
+Archive regions are accessed through their own entry points so that long-running historical reads and bulk scans do not interfere with transactional ingest.
+
+## Reporting Region
+
+The reporting region is built differently from the rest of the cluster.
+
+It consists of a small number of larger nodes sized primarily for CPU and memory. Its role is not to store primary copies of transactional or archival data, but to __execute reporting queries efficiently__.
+
+Reporting queries enter the system through a dedicated reporting entry point and are executed using MVCC snapshot semantics (`AS OF SYSTEM TIME`). Data is read from follower replicas in transactional and archive regions, while execution, memory pressure, and query coordination are isolated to the reporting nodes.
+
+This separation decouples __query execution__ from __data placement__, allowing reporting capacity to scale independently of ingest and storage.
+
+## Explicit Access Paths
+
+A defining characteristic of this architecture is that __workload intent is explicit at connection time__.
+
+Transactional ingest, reporting queries, historical extracts, semantic access patterns, and changefeeds each use different entry points. The system does not attempt to infer intent from query shape or rely on throttling and heuristics to protect critical workloads.
+
+This makes workload isolation, capacity planning, and failure analysis explicit and observable.
+
+## What Follows
+
+The sections below make this architecture concrete.
+
+They show how regions and super regions are defined, how data is placed and moved, how reporting and archival workloads execute, and how these behaviors can be inspected directly using SQL and system introspection tools.
 
 Regions
 
@@ -40,6 +204,7 @@ ALTER DATABASE nextgenreporting SURVIVE REGION FAILURE;
 ```
 
 
+End of Architecture Overview
 
 
 ```sql
@@ -222,25 +387,33 @@ SELECT batch.crdb_region FROM batch;
 Disk space per node:
 
 ```sql
-SELECT 
-  store,
-  sum(gbytes) AS gbytes
-  FROM [
-SELECT
-  s.node_id AS node,
-  replace(n.locality, 'region=', '') AS region,
-  CASE
-    WHEN replace(n.locality, 'region=', '') IN ('tx1','tx2','tx3') THEN 'transact'
-    WHEN replace(n.locality, 'region=', '') IN ('ar1','ar2','ar3') THEN 'archive'
-    WHEN replace(n.locality, 'region=', '') = 'report' THEN 'report'
-    ELSE 'unknown'
-  END AS store,
-  round(sum(s.used)/(1024*1024*1024), 2) AS gbytes
-FROM crdb_internal.kv_store_status AS s
-JOIN crdb_internal.gossip_nodes AS n
-  ON s.node_id = n.node_id
-GROUP BY s.node_id, n.locality
-] GROUP BY store;
+CREATE OR REPLACE FUNCTION store_space()
+RETURNS TABLE (store STRING, gbytes DECIMAL) AS $$
+BEGIN
+  RETURN QUERY
+  
+  SELECT 
+    store,
+    sum(gbytes) AS gbytes
+    FROM [
+  SELECT
+    s.node_id AS node,
+    replace(n.locality, 'region=', '') AS region,
+    CASE
+      WHEN replace(n.locality, 'region=', '') IN ('tx1','tx2','tx3') THEN 'transact'
+      WHEN replace(n.locality, 'region=', '') IN ('ar1','ar2','ar3') THEN 'archive'
+      WHEN replace(n.locality, 'region=', '') = 'report' THEN 'report'
+      ELSE 'unknown'
+    END AS store,
+    round(sum(s.used)/(1024*1024*1024), 2) AS gbytes
+  FROM crdb_internal.kv_store_status AS s
+  JOIN crdb_internal.gossip_nodes AS n
+    ON s.node_id = n.node_id
+  GROUP BY s.node_id, n.locality
+  ] GROUP BY store;
+
+END;
+$$ LANGUAGE PLpgSQL;
 ```
 
 ```bash
@@ -261,48 +434,7 @@ CREATE INDEX IF NOT EXISTS ON datapoints (at);
 
 
 
-Materialized View (Reporting Region)
 
-```sql
-CREATE MATERIALIZED VIEW datapoints_mv AS
-SELECT  d.at, d.station, g.name,
-        d.param0, d.param1, d.param2,
-        d.param3, d.param4,
-        d.param5,d.param6
-FROM stations as s
-JOIN datapoints as d ON s.id = d.station
-JOIN geos AS g ON s.geo = g.id;
-```
-
-```sql
-ALTER TABLE datapoints_mv CONFIGURE ZONE USING
-    range_min_bytes = 134217728,
-    range_max_bytes = 536870912,
-    gc.ttlseconds = 600,
-    global_reads = true,
-    num_replicas = 3,
-    num_voters = 3,
-    constraints = '{+region=report: 3}',
-    voter_constraints = '{+region=report}',
-    lease_preferences = '[[+region=report]]';
-```
-
-
-
-Vector Search
-
-Create vector index in transact / archive regions:
-
-```sql
-CREATE VECTOR INDEX ON datapoints (param6);
-```
-
-
-Create vector index on the materialized view:
-
-```sql
-CREATE VECTOR INDEX ON datapoints_mv (param6);
-```
 
 JSONB
 
@@ -318,9 +450,6 @@ HAVING count(*) BETWEEN 3 AND 10
 LIMIT 10;
 ```
 
-```sql
-CREATE INVERTED INDEX param5_keys_idx ON datapoints_mv (param5);
-```
 
 ```sql
 SELECT rowid
@@ -350,7 +479,7 @@ WHERE param5 @> '{"ekzny":{"pawkfrrle":{}}}';
 
 
 
-CDC
+# CDC
 
 ```sql
 SET CLUSTER SETTING kv.rangefeed.enabled = true;
@@ -387,7 +516,88 @@ Time: 65ms total (execution 64ms / network 1ms)
 ```
 
 ```bash
-kafka-topics.sh   --bootstrap-server ec2-3-17-142-130.us-east-2.compute.amazonaws.com:29092   --list
-kafka-console-consumer.sh --bootstrap-server ec2-3-17-142-130.us-east-2.compute.amazonaws.com:29092 --topic datapoints --from-beginning --group nextgenreporting
+kafka-topics.sh   --bootstrap-server <KafkaBrokerIP>:29092   --list
+kafka-console-consumer.sh --bootstrap-server  <KafkaBrokerIP>:29092:29092 --topic datapoints --from-beginning --group nextgenreporting
 ```
 
+## Inspecting Range Placement
+
+This repository includes a small inspection utility, `show_ranges.py`, used to make data placement and lifecycle behavior observable at the range level.
+
+The script walks a table row by row and uses `SHOW RANGE … FOR ROW` to determine:
+- which ranges own the rows,
+- where leaseholders are located,
+- and how replicas are distributed across regions.
+
+Results are aggregated per range and printed in a human-readable table showing row counts, leaseholder locality, and replica placement.
+
+This tool is used throughout the walkthrough to validate claims such as:
+- transactional data being leased in transactional regions,
+- archived data being re-domiciled into archive regions,
+- and both populations coexisting in the same table under different placement policies.
+
+### Usage
+
+The script requires:
+- a SQL connection string, and
+- a table name.
+
+Example:
+
+```bash
+python show_ranges.py \
+  --url "<CockroachDB connection string>" \
+  --table <table>
+```
+
+The script discovers the table’s primary key automatically and streams rows in batches to avoid loading the entire table into memory at once.
+
+```bash
+python3 show-ranges.py --url "postgresql://<user>:******@<server_ip>:26257/nextgenreporting?sslmode=verify-full" --table datapoints
+```
+
+produces something similar to
+
+```bash
+┌───┬──────────┬───────┬─────────────┬──────────────────────────────────────────────────┐
+│   │ range_id │ rows  │ leaseholder │ replicas                                         │
+╞───╪──────────╪───────╪─────────────╪──────────────────────────────────────────────────╡
+│ 1 │ 528      │ 6426  │ ar1 (13)    │ ar1 (12), ar1 (13), ar2 (17), ar2 (18), ar3 (21) │
+│ 2 │ 530      │ 9264  │ ar2 (16)    │ ar1 (10), ar1 (12), ar2 (16), ar2 (18), ar3 (19) │
+│ 3 │ 532      │ 11615 │ ar3 (21)    │ ar1 (12), ar1 (13), ar2 (16), ar3 (19), ar3 (21) │
+│ 4 │ 536      │ 1509  │ tx1 (1)     │ tx1 (1), tx1 (3), tx2 (5), tx2 (9), tx3 (7)      │
+│ 5 │ 538      │ 2201  │ tx2 (9)     │ tx1 (1), tx1 (3), tx2 (5), tx2 (9), tx3 (8)      │
+│ 6 │ 670      │ 3226  │ tx3 (2)     │ tx1 (1), tx1 (6), tx2 (9), tx3 (2), tx3 (8)      │
+├───┼──────────┼───────┼─────────────┼──────────────────────────────────────────────────┤
+│   │ TOTAL    │ 34241 │             │                                                  │
+└───┴──────────┴───────┴─────────────┴──────────────────────────────────────────────────┘
+```
+
+or
+
+```bash
+python3 show-ranges.py --url "postgresql://<user>:******@<server_ip>:26257/nextgenreporting?sslmode=verify-full" --table datapoints_mv
+```
+
+```bash
+┌───┬──────────┬───────┬─────────────┬───────────────────────────────────────┐
+│   │ range_id │ rows  │ leaseholder │ replicas                              │
+╞───╪──────────╪───────╪─────────────╪───────────────────────────────────────╡
+│ 1 │ 1479     │ 18041 │ report (14) │ report (11), report (14), report (15) │
+├───┼──────────┼───────┼─────────────┼───────────────────────────────────────┤
+│   │ TOTAL    │ 18041 │             │                                       │
+└───┴──────────┴───────┴─────────────┴───────────────────────────────────────┘
+```
+
+### Scope and limitations
+
+`show_ranges.py` is intentionally __not a production tool__.
+
+It does not scale to large or long-lived datasets, as it iterates through all rows in the table and issues per-row range inspection queries. On large tables, this would consume excessive time and cluster resources.
+
+The script exists purely as a __demonstration and validation utility__ to accompany the article:
+- to make placement and lifecycle behavior concrete,
+- to verify that configuration changes have the intended effect,
+- and to provide observable evidence for the architecture being described.
+
+It is not intended for monitoring, automation, or continuous use.
