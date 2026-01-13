@@ -36,13 +36,13 @@ $$ LANGUAGE PLpgSQL;
 
 
 
-CREATE OR REPLACE FUNCTION store_space()
-RETURNS TABLE (store STRING, gbytes DECIMAL) AS $$
+CREATE OR REPLACE FUNCTION workload_intent_space()
+RETURNS TABLE (workload_intent STRING, gbytes DECIMAL) AS $$
 BEGIN
   RETURN QUERY
 
   SELECT 
-    store,
+    workload_intent,
     sum(gbytes) AS gbytes
     FROM [
   SELECT
@@ -53,13 +53,13 @@ BEGIN
       WHEN replace(n.locality, 'region=', '') IN ('ar1','ar2','ar3') THEN 'archive'
       WHEN replace(n.locality, 'region=', '') = 'report' THEN 'report'
       ELSE 'unknown'
-    END AS store,
+    END AS workload_intent,
     round(sum(s.used)/(1024*1024*1024), 2) AS gbytes
   FROM crdb_internal.kv_store_status AS s
   JOIN crdb_internal.gossip_nodes AS n
     ON s.node_id = n.node_id
   GROUP BY s.node_id, n.locality
-  ] GROUP BY store;
+  ] GROUP BY workload_intent;
 
 END;
 $$ LANGUAGE PLpgSQL;

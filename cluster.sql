@@ -10,8 +10,17 @@ ALTER DATABASE nextgenreporting ADD region 'ar3';
 ALTER DATABASE nextgenreporting ADD region 'report';
 
 --
+-- This database will survive region failures
+--
+ALTER DATABASE nextgenreporting SURVIVE REGION FAILURE;
+
+--
 -- Create super regions
 --
 ALTER DATABASE nextgenreporting ADD SUPER REGION "transact" VALUES  "tx1","tx2","tx3"
 ALTER DATABASE nextgenreporting ADD SUPER REGION "archive" VALUES  "ar1","ar2","ar3"
 
+--
+-- Enable vector indexing in the cluster.
+--
+SET CLUSTER SETTING feature.vector_index.enabled = true;

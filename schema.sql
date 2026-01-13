@@ -1,4 +1,4 @@
-CREATE TABLE geos (
+CREATE TABLE IF NOT EXISTS geos (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     name STRING NOT NULL,
     crdb_region public.crdb_internal_region NOT NULL,
@@ -48,7 +48,7 @@ VALUES
   ('Africa (Cape Town)',        'tx3');
 
 
-CREATE TABLE stations (
+CREATE TABLE IF NOT EXISTS stations (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     geo UUID NOT NULL,
     CONSTRAINT stations_pkey PRIMARY KEY (id ASC),
@@ -66,14 +66,6 @@ FROM geos
 CROSS JOIN generate_series(1, 100);
 
 
---
--- Make both 'geos' and 'stations' tables GLOBAL
---
-ALTER TABLE geos SET LOCALITY GLOBAL;
-ALTER TABLE stations SET LOCALITY GLOBAL;
-
-
-
 CREATE TABLE datapoints (
     at TIMESTAMP NOT NULL,
     station UUID NOT NULL,
@@ -88,28 +80,24 @@ CREATE TABLE datapoints (
     crdb_internal_at_station_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(at, station))), 16:::INT8)) VIRTUAL,
     CONSTRAINT datapoints_pkey PRIMARY KEY (station ASC, at ASC) USING HASH WITH (bucket_count=16),
     CONSTRAINT datapoints_station_fkey FOREIGN KEY (station) REFERENCES stations(id) ON DELETE CASCADE,
-    INDEX datapoints_at_idx (at ASC),
-    VECTOR INDEX datapoints_param6_idx (param6 vector_l2_ops)
+    INDEX datapoints_at_idx (at ASC)
 ) LOCALITY REGIONAL BY ROW AS crdb_region;
 
 
 --
--- Create a vector index (will set it later in the reporting region)
+-- Create a vector index on param6 column.
 --
-SET CLUSTER SETTING feature.vector_index.enabled = true;
-CREATE VECTOR INDEX ON datapoints (param6);
+CREATE VECTOR IF NOT EXISTS INDEX ON datapoints (param6);
 
 
 --
--- ????
+-- More performance tweaking
 --
 CREATE INDEX IF NOT EXISTS datapoints_station_storing_rec_idx
     ON datapoints (station) STORING (param0, param1, param2, param3, param4); 
 
 CREATE INDEX IF NOT EXISTS datapoints_at ON datapoints USING btree (at ASC);
 CREATE INDEX IF NOT EXISTS datapoints_param0_rec_idx ON datapoints (param0);
-
-
 
 
 --
@@ -124,13 +112,10 @@ FROM stations as s
 JOIN datapoints as d ON s.id = d.station
 JOIN geos AS g ON s.geo = g.id;
 
-CREATE INDEX ON datapoints_mv (length(param4));
-CREATE INVERTED INDEX param5_keys_idx ON datapoints_mv (param5);
-CREATE VECTOR INDEX ON datapoints_mv (param6);
 
 --
--- REPORTING workloads
+-- Indexes to help with some specific reporting queries
 --
-
-
-
+CREATE INDEX IF NOT EXISTS ON datapoints_mv (length(param4));
+CREATE INVERTED INDEX IF NOT EXISTS param5_keys_idx ON datapoints_mv (param5);
+CREATE VECTOR INDEX IF NOT EXISTS ON datapoints_mv (param6);

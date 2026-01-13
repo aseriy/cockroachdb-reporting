@@ -167,19 +167,6 @@ The sections below make this architecture concrete.
 
 They show how regions and super regions are defined, how data is placed and moved, how reporting and archival workloads execute, and how these behaviors can be inspected directly using SQL and system introspection tools.
 
-Regions
-
-```sql
-ALTER DATABASE nextgenreporting SET PRIMARY REGION "tx1";
-ALTER DATABASE nextgenreporting ADD region 'tx2';
-ALTER DATABASE nextgenreporting ADD region 'tx3';
-ALTER DATABASE nextgenreporting ADD SUPER REGION "transact" VALUES  "tx1","tx2","tx3"
-ALTER DATABASE nextgenreporting ADD region 'ar1';
-ALTER DATABASE nextgenreporting ADD region 'ar2';
-ALTER DATABASE nextgenreporting ADD region 'ar3';
-ALTER DATABASE nextgenreporting ADD SUPER REGION "archive" VALUES  "ar1","ar2","ar3"
-ALTER DATABASE nextgenreporting ADD region 'report';
-```
 
 
 ```sql
@@ -199,9 +186,6 @@ SHOW REGIONS FROM DATABASE nextgenreporting;
 (7 rows)
 ```
 
-```sql
-ALTER DATABASE nextgenreporting SURVIVE REGION FAILURE;
-```
 
 
 End of Architecture Overview
@@ -283,147 +267,25 @@ FROM [SHOW RANGE FROM TABLE datapoints FOR ROW ('tx1', 0, '00ee18f6-60a4-4bf0-af
 
 
 
-
-
-
 ## Archiving
 
+Our `datapoints` table is `REGIONAL BY ROW` where the `crdb_region` column, although `NOT VISIBLE`, determines the regions where the row is physically stored. Our transaction workload sets this column to `tx1`, `tx2` or `tx3` regions at `INSERT` time.
 
-```sql
-WITH rows_updated AS (
-WITH
-batch AS (
-    SELECT at, station
-    FROM datapoints
-    WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 month'
-    LIMIT 1000
-),
-region AS (
-    SELECT r::crdb_internal_region
-    FROM (VALUES ('ar1'), ('ar2'), ('ar3')) v(r)
-    ORDER BY random()
-    LIMIT 1
-)
-UPDATE datapoints
-SET crdb_region = region.r
-FROM batch, region
-WHERE datapoints.station = batch.station AND datapoints.at = batch.at RETURNING 1
-) SELECT count(*) FROM rows_updated;
-```
+Moving a row's physical data to another region is accomplished by simply updating the `crdb_region` column to the destination region. The cluster will relocate the physical data to a range in the specified region while the row logically remains intact. This is the underlying mechanism of the `archive_datapoints()` stored procedure. The code is in `procs_funcs.sql` file.
 
-TODO: Link the below to the archive_datapoint.sql file.
-```sql
-CREATE OR REPLACE PROCEDURE archive_datapoints() AS $$
-DECLARE
-  rows_updated_c INT := 0;
+Here is how this stored proc works:
+1. It selects rows from the transactional regions (`tx1`, `tx2` or `tx3`) based on the `at` column value, looking for this timestamp to be older than 1 month. It does it in batches of 1000 rows.
+2. For every row selected, an `UPDATE` query is run that changes the `crdb_region` column to one of the archive regions (`ar1`, `ar2` or `ar3`). The target archive region is picked randomly to maintain an even distribution of the archived rows amongs the archive regions.
 
-BEGIN
-  LOOP
-    WITH rows_updated AS (
-    WITH
-    batch AS (
-        SELECT at, station
-        FROM datapoints
-        WHERE crdb_region IN ('tx1', 'tx2', 'tx3') AND at < now() - INTERVAL '1 month'
-        LIMIT 1000
-    ),
-    region AS (
-        SELECT r::crdb_internal_region
-        FROM (VALUES ('ar1'), ('ar2'), ('ar3')) v(r)
-        ORDER BY random()
-        LIMIT 1
-    )
-    UPDATE datapoints
-    SET crdb_region = region.r
-    FROM batch, region
-    WHERE datapoints.station = batch.station AND datapoints.at = batch.at RETURNING 1
-    ) SELECT count(*) INTO rows_updated_c FROM rows_updated;
-
-    RAISE NOTICE 'Updated % rows', rows_updated_c;
-    IF rows_updated_c < 1 THEN
-      RAISE NOTICE 'Done.';
-      EXIT;
-    END IF;
-    
-  END LOOP;
-END;
-$$ LANGUAGE PLpgSQL;
-```
-
+That's it!
 
 ```sql
 CALL archive_datapoints();
 ```
 
+The only caveat is that since `CALL`ing a stored procedure is wrapped inside a transaction, archving a large number of rows may cause a serialization error. In that case the stored procedure call needs to be re-tried until it succedes. The more frequently the archiing process is invoked, the less likely it is to create a contention, naturally. It's worth mentioning that this stored proc is here for the demo purposes and likely won't pass your production muster. It's only here to demonstrate the architectural principals.
 
 
-
-
-
-List ranges associated with a table:
-
-```sql
-SELECT range_id, range_size, lease_holder, replicas, replica_localities FROM                
-crdb_internal.ranges WHERE range_id IN (SELECT range_id FROM   
-[show ranges from table datapoints]) ORDER BY range_id;  
-```
-
-
-
-```sql
-SELECT range_id, lease_holder, lease_holder_locality, replicas, replica_localities
-FROM [SHOW RANGE FROM TABLE datapoints FOR ROW ('tx1', 0, '00ee18f6-60a4-4bf0-af36-37b50861e798', '2025-03-26 03:00:53.323479')];
-```
-
-```sql
-WITH batch AS (
-  SELECT crdb_region, crdb_internal_at_station_shard_16,
-  station, at
-  FROM datapoints LIMIT 1000 OFFSET 0
-)
-SELECT batch.crdb_region FROM batch;
-```
-
-Disk space per node:
-
-```sql
-CREATE OR REPLACE FUNCTION store_space()
-RETURNS TABLE (store STRING, gbytes DECIMAL) AS $$
-BEGIN
-  RETURN QUERY
-  
-  SELECT 
-    store,
-    sum(gbytes) AS gbytes
-    FROM [
-  SELECT
-    s.node_id AS node,
-    replace(n.locality, 'region=', '') AS region,
-    CASE
-      WHEN replace(n.locality, 'region=', '') IN ('tx1','tx2','tx3') THEN 'transact'
-      WHEN replace(n.locality, 'region=', '') IN ('ar1','ar2','ar3') THEN 'archive'
-      WHEN replace(n.locality, 'region=', '') = 'report' THEN 'report'
-      ELSE 'unknown'
-    END AS store,
-    round(sum(s.used)/(1024*1024*1024), 2) AS gbytes
-  FROM crdb_internal.kv_store_status AS s
-  JOIN crdb_internal.gossip_nodes AS n
-    ON s.node_id = n.node_id
-  GROUP BY s.node_id, n.locality
-  ] GROUP BY store;
-
-END;
-$$ LANGUAGE PLpgSQL;
-```
-
-```bash
-  store   | gbytes
------------+---------
-  transact |  11.47
-  archive  |  11.61
-  report   |   4.65
-(3 rows)
-```
 
 
 Reporting queries:
@@ -524,7 +386,7 @@ kafka-console-consumer.sh --bootstrap-server  <KafkaBrokerIP>:29092:29092 --topi
 
 This repository includes a small inspection utility, `show_ranges.py`, used to make data placement and lifecycle behavior observable at the range level.
 
-The script walks a table row by row and uses `SHOW RANGE … FOR ROW` to determine:
+The script inspects range ownership via row-level inspection, then aggregates the results per range. It walks a table row by row and uses `SHOW RANGE … FOR ROW` to determine:
 - which ranges own the rows,
 - where leaseholders are located,
 - and how replicas are distributed across regions.
@@ -601,3 +463,22 @@ The script exists purely as a __demonstration and validation utility__ to accomp
 - and to provide observable evidence for the architecture being described.
 
 It is not intended for monitoring, automation, or continuous use.
+
+While we're on the subject of inspecting range placement, let's quickly talk about inspecting disk storage associated with each workload intent, i.e. __transact__, __archive__ and __report__. File `procs_funcs.sql` defines function `workload_intent_space()` that looks at the disk space used by the individual nodes associated with each workload intent and then aggregates the findings into a table. The function can be invoked as
+
+```sql
+SELECT * FROM workload_intent_space();
+```
+
+and produces the output similar to
+
+```bash
+  workload_intent | gbytes
+------------------+---------
+  transact        |  12.35
+  archive         |  12.67
+  report          |   5.00
+(3 rows)
+```
+
+An obvious observation here is that the disk space associated with __report__ is relatively low to __transact__ and __archive__ since the rows in the `datapoints` table are stored exclusively in either __transact__ or __archive__.
