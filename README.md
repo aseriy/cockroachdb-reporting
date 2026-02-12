@@ -1,6 +1,6 @@
 # Introduction
 
-This repository contains the reference artifacts for Part 2 of Rethinking the Reporting Platform.
+This repository contains the reference artifacts for the article "A Reference Architecture for a Next Generation Global Reporting Platform".
 
 It accompanies the article and provides the concrete schema, configuration, stored procedures, workloads, and inspection utilities used to exercise the architecture described there. The intent is to make specific architectural claims observable, not to provide a turnkey deployment or tutorial.
 
